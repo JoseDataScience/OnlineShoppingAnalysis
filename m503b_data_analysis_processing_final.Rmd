@@ -1,0 +1,525 @@
+---
+title: "m503b_proj"
+author: "Jose Aguilar, Leo Amador, and Vincent Bell"
+date: "12/8/2021"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE)
+```
+
+
+```{r Cleaning and Reading In Data}
+library(stringr) 
+library(speedglm) #Needed to do linear regression quickly
+library(data.table) #Needed to read in the tsv file.
+library(glmnet)
+library(dplyr)
+library(ggplot2)
+library(caret)
+
+RMSLE = function(y1, y2){
+  return(sqrt(mean((log(y1 + 1) - log(y2 + 1))^2)))
+}
+
+Mode <- function(x) {
+  ux <- unique(x)
+  ux[which.max(tabulate(match(x, ux)))]
+}
+
+data<-as.data.frame(fread("train.tsv")) #Reading in data from where I saved it.
+
+data_clean = data
+
+rm(data) #Removing data to clear up space.
+
+data_clean$category_name[data_clean$category_name == ""] = "None"
+data_clean$brand_name[data_clean$brand_name == ""] = "None" #Giving the brand name "None" if there is no provided brand name.
+data_clean$item_description[data_clean$item_description == "No description yet"] = "" #Setting the empty description to be nothing so that its length will be 0 instead of 18.
+
+data_clean_texts = data_clean[,-1]
+
+data_clean$item_description = sapply(data_clean$item_description, nchar) #Going row by row to set item_description equal to the length of the item_description as a (temporary) substitute for the quality of the description.
+data_clean = data_clean[,-1] #Removing the first column that just keeps track of item id.
+
+data_clean$name = sapply(data_clean$name, nchar) #Replacing the actual item name with the length of the item name as an estimate for naming quality.
+
+
+
+#Adjusting some parameters to make plots nicer
+par(mar=c(10,5,3,1)) #Controls margins
+options(scipen=5) #Controls scientific notation activation 
+
+```
+
+
+
+```{r Exploratory Data Analysis}
+paste("RMSLE using mean:", RMSLE(rep(mean(data_clean$price), length(data_clean$price)), data_clean$price))
+
+#####################################################################################################
+
+hist(data_clean$price) #Difficult to visualize the distribution
+hist(log(data_clean$price))  #Easier to visualize and appears quite normal but is skewed right. i.e. mean is greater than median. This means that price is approximately log normal
+
+qqnorm(log(data_clean_texts$price + 1), pch = 1, frame = FALSE)
+qqline(log(data_clean_texts$price + 1), col = "steelblue", lwd = 2)
+
+#####################################################################################################
+hist(data_clean$price[data_clean$brand_name == "None"], xlab = "Prices", main = "Histogram of None Brand Prices")
+hist(data_clean$price[data_clean$brand_name == "None" & data_clean$price < 100], xlab = "Prices", main = "Histogram of None Brand Prices < $100")
+
+paste("Number of unique brands: ", length(unique(data_clean$brand_name))) #There are 4810 brands
+
+brand.counts = data_clean %>% count(brand_name) #Getting the counts of each brand name.
+
+brand.counts.counts = brand.counts %>% count(n)
+
+paste("Number of brands with less than 10 observations: ", length(which(brand.counts <= 10)), "or", 100*length(which(brand.counts <= 10))/length(unique(data_clean$brand_name)), "% of brands") #Seeing how many brands show up <= 10 number of times. 
+
+paste("But, brands with less than 10 observations only make up:", 100*sum(brand.counts$n[brand.counts$n <= 10])/dim(data_clean)[1],"% of the rows")
+
+paste("Less than 25: ", length(which(brand.counts <= 25)), "or", 100*length(which(brand.counts <= 25))/length(unique(data_clean$brand_name)), "% of brands") #Seeing how many brands show up <= 25 number of times.
+
+paste("But, brands with less than 25 observations only make up:", 100*sum(brand.counts$n[brand.counts$n <= 25])/dim(data_clean)[1],"% of the rows")
+
+paste("Less than 100: ", length(which(brand.counts <= 100)), "or", 100*length(which(brand.counts <= 100))/length(unique(data_clean$brand_name)), "% of brands") #Seeing how many brands show up <= 25 number of times.
+
+paste("But, brands with less than 100 observations only make up:", 100*sum(brand.counts$n[brand.counts$n <= 100])/dim(data_clean)[1],"% of the rows")
+
+
+paste("Items with 'None' brand: ", length(which(data_clean$brand_name == "None")))
+
+
+brand.counts = brand.counts[order(brand.counts$n, decreasing = T),] 
+barplot(brand.counts$n[1:10], names.arg = brand.counts$brand_name[1:10], las = 2) 
+
+```
+
+Need to try and reduce the number of "None" brands. Check the name to see if they include the actual brand name.
+
+```{r Attempting to Fix None Brand Using Name}
+fix_none = function(row, brand_names){
+  name_string = row["name"]
+  desc_string = row["item_description"]
+  brands_in = brand_names[(brand_names$lower_brand_name %in% str_split_fixed(tolower(name_string), pattern = " ", n = Inf) | brand_names$lower_brand_name %in% str_split_fixed(tolower(desc_string), pattern = " ", n = Inf)), ]
+  if(dim(brands_in)[1] == 0)
+    return ("None")
+  if(length(brands_in$brand_name) == 1)
+    return (brands_in$brand_name)
+  else
+    return(brands_in$brand_name[which(brands_in$n == max(brands_in$n))][1])
+}
+
+temp = data_clean_texts[data_clean_texts$brand_name == "None",]
+temp.brands = data_clean_texts %>% count(brand_name)
+
+temp.ignore_brands = c("pink", "so", "and", "ask", "ring", "boots", "lot", "clean", "casual", "active", "silver", "all", "x", "m", "tag", "always", "sure", "next", "cat", "diamond", "complete", "machine", "velvet", "rainbow", "together", "simple", "blue", 'head', 'game', 'vintage', 'tone')
+
+temp.brands$lower_brand_name = lapply(temp.brands$brand_name, tolower)
+
+temp.brands = temp.brands[-which(temp.brands$lower_brand_name %in% temp.ignore_brands),] #Removing brands because it'll be difficult to differentiate the brand from the actual word. i.e. PINK vs Pink
+
+temp.new_brands = unlist(apply(temp, 1, fix_none, brand_names = temp.brands))
+
+data_clean$brand_name[data_clean$brand_name == "None"] = temp.new_brands
+data_clean_texts$brand_name[data_clean_texts$brand_name == "None"] = temp.new_brands
+
+temp.new_brands = as.data.frame(temp.new_brands)
+temp.new_brands.counts = temp.new_brands %>% count(temp.new_brands)
+```
+
+Continuing with our data exploration.
+
+
+```{r Exploratory Data Analysis Continued}
+rm(temp.new_brands)
+rm(temp.new_brands.counts)
+
+#Looking at the brand name column now that there should be less None's.
+length(which(data_clean$brand_name == "None"))
+
+hist(data_clean$price[data_clean$brand_name == "None"], xlab = "Prices", main = "Histogram of None Brand Prices")
+hist(data_clean$price[data_clean$brand_name == "None" & data_clean$price < 100], xlab = "Prices", main = "Histogram of None Brand Prices < $100")
+
+paste("Number of unique brands: ", length(unique(data_clean$brand_name))) #There are 4810 brands
+
+brand.counts = data_clean %>% count(brand_name) #Getting the counts of each brand name.
+
+brand.counts.counts = brand.counts %>% count(n)
+
+paste("Number of brands with less than 10 observations: ", length(which(brand.counts <= 10)), "or", 100*length(which(brand.counts <= 10))/length(unique(data_clean$brand_name)), "% of brands") #Seeing how many brands show up <= 10 number of times. 
+
+paste("But, brands with less than 10 observations only make up:", 100*sum(brand.counts$n[brand.counts$n <=10])/dim(data_clean)[1],"% of the rows")
+
+paste("Less than 25: ", length(which(brand.counts <= 25)), "or", 100*length(which(brand.counts <= 25))/length(unique(data_clean$brand_name)), "% of brands") #Seeing how many brands show up <= 25 number of times.
+
+paste("But, brands with less than 25 observations only make up:", 100*sum(brand.counts$n[brand.counts$n <= 25])/dim(data_clean)[1],"% of the rows")
+
+paste("Less than 100: ", length(which(brand.counts <= 100)), "or", 100*length(which(brand.counts <= 100))/length(unique(data_clean$brand_name)), "% of brands") #Seeing how many brands show up <= 25 number of times.
+
+paste("But, brands with less than 100 observations only make up:", 100*sum(brand.counts$n[brand.counts$n <= 100])/dim(data_clean)[1],"% of the rows")
+
+
+paste("Items with 'None' brand: ", length(which(data_clean$brand_name == "None")))
+
+plot(brand.counts.counts$nn[1:25], xlab = "N", ylab = "Number of brands listed N times") # Plotting the count of counts. i.e. There's ~850 brands that only show up once now.
+
+brand.counts = brand.counts[order(brand.counts$n, decreasing = T),] 
+barplot(brand.counts$n[1:10], names.arg = brand.counts$brand_name[1:10], las = 2)
+
+for(i in brand.counts$brand_name[brand.counts$n > 1000]){
+  hist(log(data_clean$price[data_clean$brand_name == i]), xlab = "log(Price)", ylab = i, main = paste(i, "- Count: ", brand.counts$n[brand.counts$brand_name == i]))
+}
+
+#################################################################################################
+category.counts = data_clean %>% count(category_name)
+category.counts.counts = category.counts %>% count(n)
+
+paste("Number of categories with less than 10 observations: ", length(which(category.counts <= 10)), "or", 100*length(which(category.counts <= 10))/length(unique(data_clean$category_name)), "% of categories") 
+
+paste("Categories with less than 10 observations only make up", 100*sum(category.counts$n[category.counts$n <= 10])/dim(data_clean)[1], "% of rows")
+
+
+
+paste("Less than 25: ", length(which(category.counts <= 25)), "or", 100*length(which(category.counts <= 25))/length(unique(data_clean$category_name)), "% of categories")
+
+paste("Categories with less than 25 observations only make up", 100*sum(category.counts$n[category.counts$n <= 25])/dim(data_clean)[1], "% of rows")
+
+
+paste("Less than 100: ", length(which(category.counts <= 100)), "or", 100*length(which(category.counts <= 100))/length(unique(data_clean$category_name)), "% of categories") 
+
+paste("Categories with less than 100 observations only make up", 100*sum(category.counts$n[category.counts$n <=  100])/dim(data_clean)[1], "% of rows")
+
+paste("Categories with 'None' category:", length(which(data_clean$category_name == "None")))
+
+
+category.counts = category.counts[order(category.counts$n, decreasing = T),]
+barplot(category.counts$n[1:10], names.arg = category.counts$category_name[1:10], las = 2)
+
+```
+
+```{r Fixing Category Name}
+split_category = function(category_name){
+  return(stringr::str_split_fixed(category_name, pattern = "/", n = 3))
+} 
+
+fix_category = function(row, full_data){
+  if(row["brand_name"] != "None"){
+    return(Mode(full_data$category_name[full_data$brand_name == row["brand_name"]]))
+  }
+  return("Other/Other/Other")
+}
+
+
+
+temp = data_clean[data_clean$category_name == "None", ]
+temp.new_categories = unlist(apply(temp, 1, fix_category, full_data = data_clean))
+temp.new_categories[temp.new_categories == "None"] = "Other/Other/Other"
+
+
+data_clean$category_name[data_clean$category_name == "None"] = temp.new_categories
+data_clean_texts$category_name[data_clean_texts$category_name == "None"] = temp.new_categories
+
+
+new_cols = as.data.frame(split_category(data_clean$category_name))
+colnames(new_cols) = c("Category1", "Category2", "Category3")
+data_clean = cbind(data_clean, new_cols)
+data_clean_texts = cbind(data_clean_texts, new_cols)
+
+data_clean$Category2[data_clean$Category2 == "Others"] = "Other"
+data_clean$Category3[data_clean$Category3 == "Others"] = "Other"
+
+data_clean_texts$Category2[data_clean_texts$Category2 == "Others"] = "Other"
+data_clean_texts$Category3[data_clean_texts$Category3 == "Others"] = "Other"
+
+
+rm(new_cols)
+```
+
+
+
+```{r Exploratory Data Analysis Continued 2}
+category1.counts = data_clean %>% count(Category1)
+category2.counts = data_clean %>% count(Category2)
+category3.counts = data_clean %>% count(Category3)
+
+
+paste("The least represented Category1 element is represented", min(category1.counts$n), "times")
+paste("The least represented Category2 element is represented", min(category2.counts$n), "times")
+paste("The least represented Category3 element is represented", min(category3.counts$n), "times")
+paste("Category3 categories with <= 100 rows make up", 100*sum(category3.counts$n[category3.counts$n <= 100])/dim(data_clean)[1], "% of the data.")
+
+category1.counts = category1.counts[order(category1.counts$n, decreasing = T),]
+barplot(category1.counts$n[1:10], names.arg = category1.counts$Category1[1:10], las = 2)
+
+category2.counts = category2.counts[order(category2.counts$n, decreasing = T),]
+barplot(category2.counts$n[1:10], names.arg = category2.counts$Category2[1:10], las = 2)
+
+category3.counts = category3.counts[order(category3.counts$n, decreasing = T),]
+barplot(category3.counts$n[1:10], names.arg = category3.counts$Category3[1:10], las = 2)
+
+```
+
+
+```{r Removing Underrepresented Brands and Categories}
+brand.sensitivity = 25
+category3.sensitivity = 25
+
+data_clean$brand_name[data_clean$brand_name %in% brand.counts$brand_name[brand.counts$n <= brand.sensitivity]] = "None"
+data_clean_texts$brand_name[data_clean_texts$brand_name %in% brand.counts$brand_name[brand.counts$n <= brand.sensitivity]] = "None"
+
+data_clean$Category3[data_clean$Category3 %in% category3.counts$Category3[category3.counts$n <= category3.sensitivity]] = "Other"
+data_clean_texts$Category3[data_clean$Category3 %in% category3.counts$Category3[category3.counts$n <= category3.sensitivity]] = "Other"
+
+brand.counts = data_clean %>% count(brand_name)
+brand.counts.counts = brand.counts %>% count(n)
+category3.counts = data_clean %>% count(Category3)
+```
+
+
+```{r Exploratory Data Analysis Continued 3}
+h1 = hist(data_clean$price[data_clean$shipping == 0 & data_clean$price < 200], nclass = 50, plot = F)
+h2 = hist(data_clean$price[data_clean$shipping == 1 & data_clean$price < 200], nclass = 50, plot = F)
+plot(h1, col=rgb(0,0,1,1/4), freq = F, ylim = c(0,0.06), xlab = "Prices", main = "Comparing Distributions Between Shipping and No Shipping")
+plot(h2, col=rgb(1,0,0,1/4), add = T, freq = F, ylim = c(0,0.06))
+
+legend(x = 100, y=0.04, legend = c(paste("Mean Free Shipping: ",  round(mean(data_clean$price[data_clean$shipping == 0 & data_clean$price < 200]), 1)), paste("Mean Normal Shipping: ", round(mean(data_clean$price[data_clean$shipping == 1 & data_clean$price < 200]), 1))), fill = c(rgb(0,0,1,1/4), rgb(1,0,0,1/4))) 
+
+
+median(data_clean$price[data_clean$shipping == 0]) - median(data_clean$price[data_clean$shipping == 1]) #Difference between with free shipping (0) and not free shipping (1) is 6
+
+######################################################################################################
+data_clean$shipping_dif1 = 0
+data_clean$shipping_dif2 = 0
+data_clean$shipping_dif3 = 0
+data_clean_texts$shipping_dif1 = 0
+data_clean_texts$shipping_dif2 = 0
+data_clean_texts$shipping_dif3 = 0
+
+
+for(i in unique(data_clean$Category1)){
+  temp = (data_clean$Category1 == i)
+  data_clean$shipping_dif1[temp] = median(data_clean$price[temp & data_clean$shipping == 0]) - median(data_clean$price[temp & data_clean$shipping == 1])
+  data_clean_texts$shipping_dif1[temp] = median(data_clean$price[temp & data_clean$shipping == 0]) - median(data_clean$price[temp & data_clean$shipping == 1])
+}
+
+for(i in unique(data_clean$Category2)){
+  temp = (data_clean$Category2 == i)
+  data_clean$shipping_dif2[temp] = median(data_clean$price[temp & data_clean$shipping == 0]) - median(data_clean$price[temp & data_clean$shipping == 1])
+  data_clean_texts$shipping_dif2[temp] = median(data_clean$price[temp & data_clean$shipping == 0]) - median(data_clean$price[temp & data_clean$shipping == 1])
+}
+
+
+for(i in unique(data_clean$Category3)){
+  temp = (data_clean$Category3 == i)
+  data_clean$shipping_dif3[temp] = median(data_clean$price[temp & data_clean$shipping == 0]) - median(data_clean$price[temp & data_clean$shipping == 1]) 
+  data_clean_texts$shipping_dif3[temp] = median(data_clean$price[temp & data_clean$shipping == 0]) - median(data_clean$price[temp & data_clean$shipping == 1])
+}
+
+
+paste("There are this many free items:", length(which(data_clean$price == 0))) #Seeing how many free items there are.
+
+data_clean = data_clean[data_clean$price != 0,] #Dropping the free items.
+data_clean_texts = data_clean_texts[data_clean_texts$price != 0,] #Dropping the free items
+
+
+ggplot(data_clean, aes(x=Category1, y=log(price)), las = 2) + geom_boxplot(outlier.colour="black", outlier.shape=16,
+             outlier.size=2, notch=FALSE)
+
+ggplot(data_clean, aes(x=Category1, y=shipping_dif1), las = 2) + geom_boxplot(outlier.colour="black", outlier.shape=16, outlier.size=2, notch=FALSE, ylab = "Median Shipping DIfference of Category1 Item")
+ 
+paste("There are this many free items:", length(which(data_clean$price == 0))) #Seeing how many free items there are.
+
+
+######################################################################################################
+ggplot(data_clean, aes(x= as.factor(item_condition_id), y=log(price))) + geom_boxplot(outlier.colour="black", outlier.shape=16, outlier.size=2, notch=FALSE)
+
+hist(log(data_clean$price[data_clean$item_condition_id == 1]), xlim = c(0,8), xlab = "Log(Price) w/ Condition = 1", main = paste("Median of Log:", median(log(data_clean$price[data_clean$item_condition_id == 1]))))
+hist(log(data_clean$price[data_clean$item_condition_id == 2]), xlim = c(0,8), xlab = "Log(Price) w/ Condition = 2", main = paste("Median of Log:", median(log(data_clean$price[data_clean$item_condition_id == 2]))))
+hist(log(data_clean$price[data_clean$item_condition_id == 3]), xlim = c(0,8), xlab = "Log(Price) w/ Condition = 3", main = paste("Median of Log:", median(log(data_clean$price[data_clean$item_condition_id == 3]))))
+hist(log(data_clean$price[data_clean$item_condition_id == 4]), xlim = c(0,8), xlab = "Log(Price) w/ Condition = 4", main = paste("Median of Log:", median(log(data_clean$price[data_clean$item_condition_id == 4]))))
+hist(log(data_clean$price[data_clean$item_condition_id == 5]), xlim = c(0,8), xlab = "Log(Price) w/ Condition = 5", main = paste("Median of Log:", median(log(data_clean$price[data_clean$item_condition_id == 5]))))
+
+summary(aov(price~item_condition_id, data = data_clean[data_clean$item_condition_id != 5,]))
+
+
+item_cond.counts = data_clean_texts %>% count(item_condition_id)
+barplot(item_cond.counts$n, names.arg = c(1,2,3,4,5), las = 1) 
+
+rm(h1)
+rm(h2)
+
+```
+
+
+```{r Analyzing Test Data}
+data_test <-as.data.frame(fread("test_stg2.tsv"))
+
+data_test$category_name[data_test$category_name == ""] = "None"
+data_test$brand_name[data_test$brand_name == ""] = "None" #Giving the brand name "None" if there is no provided brand name.
+data_test$item_description[data_test$item_description == "No description yet"] = "" #Setting the empty description to be nothing so that its length will be 0 instead of 18.
+
+data_test = data_test[,-1]
+
+#########################################################################################
+
+paste("Number of unique brands: ", length(unique(data_test$brand_name))) #There are 4810 brands
+
+brand.counts.test = data_test %>% count(brand_name) #Getting the counts of each brand name.
+
+brand.counts.test.counts = brand.counts.test %>% count(n)
+
+paste("Number of brands with less than 10 observations: ", length(which(brand.counts.test <= 10)), "or", 100*length(which(brand.counts.test <= 10))/length(unique(data_test$brand_name)), "% of brands") #Seeing how many brands show up <= 10 number of times. 
+
+paste("But, brands with less than 10 observations only make up:", 100*sum(brand.counts.test$n[brand.counts.test$n <= 10])/dim(data_test)[1],"% of the rows")
+
+paste("Less than 25: ", length(which(brand.counts.test <= 25)), "or", 100*length(which(brand.counts.test <= 25))/length(unique(data_test$brand_name)), "% of brands") #Seeing how many brands show up <= 25 number of times.
+
+paste("But, brands with less than 25 observations only make up:", 100*sum(brand.counts.test$n[brand.counts.test$n <= 25])/dim(data_test)[1],"% of the rows")
+
+paste("Less than 100: ", length(which(brand.counts.test <= 100)), "or", 100*length(which(brand.counts.test <= 100))/length(unique(data_test$brand_name)), "% of brands") #Seeing how many brands show up <= 25 number of times.
+
+paste("But, brands with less than 100 observations only make up:", 100*sum(brand.counts.test$n[brand.counts.test$n <= 100])/dim(data_test)[1],"% of the rows")
+
+
+paste("Items with 'None' brand: ", length(which(data_test$brand_name == "None")), "Or", 100*length(which(data_test$brand_name == "None"))/3460725, "% of the data") 
+
+head(brand.counts[order(brand.counts$n, decreasing = T),])
+
+##########################################################################################################
+category.counts.test = data_test %>% count(category_name)
+category.counts.test.counts = category.counts.test %>% count(n)
+
+paste("Number of categories with less than 10 observations: ", length(which(category.counts.test <= 10)), "or", 100*length(which(category.counts.test <= 10))/length(unique(data_test$category_name)), "% of categories") #Seeing how many brands show up <= 10 number of times. 
+
+paste("But, categories with less than 10 observations only make up:", 100*sum(category.counts.test$n[category.counts.test$n <= 10])/dim(data_test)[1],"% of the rows")
+
+paste("Less than 25: ", length(which(category.counts.test <= 25)), "or", 100*length(which(category.counts.test <= 25))/length(unique(data_test$category_name)), "% of categories") #Seeing how many brands show up <= 25 number of times.
+
+paste("But, categories with less than 25 observations only make up:", 100*sum(category.counts.test$n[category.counts.test$n <= 25])/dim(data_test)[1],"% of the rows")
+
+paste("Less than 100: ", length(which(category.counts.test <= 100)), "or", 100*length(which(category.counts.test <= 100))/length(unique(data_test$category_name)), "% of categories") #Seeing how many brands show up <= 25 number of times.
+
+paste("But, categories with less than 100 observations only make up:", 100*sum(category.counts.test$n[category.counts.test$n <= 100])/dim(data_test)[1],"% of the rows")
+
+
+category.counts.test = category.counts.test[order(category.counts.test$n, decreasing = T),]
+
+barplot(category.counts.test$n[1:10], names.arg = category.counts.test$category_name[1:10], las = 2)
+
+
+##############################################################
+brand.counts.test = brand.counts.test[order(brand.counts.test$n, decreasing = T),]
+barplot(brand.counts.test$n[1:10], names.arg = brand.counts.test$brand_name[1:10], las = 2) 
+
+```
+
+
+```{r Pre-Processing Test Data}
+par(mar=c(10,5,3,1)) #Controls margins
+options(scipen=5) #Controls scientific notation activation 
+
+######################################################################
+
+temp = data_test[data_test$brand_name == "None",]
+temp.new_brands = unlist(apply(temp, 1, fix_none, brand_names = temp.brands))
+data_test$brand_name[data_test$brand_name == "None"] = temp.new_brands
+
+#######################################################################
+
+temp = data_test[data_test$category_name == "None", ]
+temp.new_categories = unlist(apply(temp, 1, fix_category, full_data = data_test))
+temp.new_categories[temp.new_categories == "None"] = "Other/Other/Other"
+
+
+data_test$category_name[data_test$category_name == "None"] = temp.new_categories
+
+new_cols = as.data.frame(split_category(data_test$category_name))
+colnames(new_cols) = c("Category1", "Category2", "Category3")
+data_test = cbind(data_test, new_cols)
+
+data_test$Category2[data_clean$Category2 == "Others"] = "Other"
+data_test$Category3[data_clean$Category3 == "Others"] = "Other"
+
+#######################################################################
+category1.filter = unique(data_clean_texts$Category1)
+category2.filter = unique(data_clean_texts$Category2)
+category3.filter = unique(data_clean_texts$Category3)
+brand.filter = unique(data_clean_texts$brand_name)
+
+data_test$brand_name[!(data_test$brand_name %in% brand.filter)] = "None"
+data_test$Category1[!(data_test$Category1 %in% category1.filter)] = "Other"
+data_test$Category2[!(data_test$Category2 %in% category2.filter)] = "Other"
+data_test$Category3[!(data_test$Category3 %in% category3.filter)] = "Other"
+
+#########################################################################
+data_test$brand_name[data_test$brand_name %in% brand.counts$brand_name[brand.counts$n <= brand.sensitivity]] = "None"
+data_test$Category3[data_clean$Category3 %in% category3.counts$Category3[category3.counts$n <= category3.sensitivity]] = "Other"
+
+#########################################################################
+
+cat1.ship = as.data.frame(cbind(unique(data_clean_texts$Category1), data_clean_texts$shipping_dif1[match(unique(data_clean_texts$Category1), data_clean_texts$Category1)]))
+
+cat2.ship = as.data.frame(cbind(unique(data_clean_texts$Category2), data_clean_texts$shipping_dif2[match(unique(data_clean_texts$Category2), data_clean_texts$Category2)]))
+
+cat3.ship = as.data.frame(cbind(unique(data_clean_texts$Category3), data_clean_texts$shipping_dif1[match(unique(data_clean_texts$Category3), data_clean_texts$Category3)]))
+
+data_test$shipping_dif1 = 0
+data_test$shipping_dif2 = 0
+data_test$shipping_dif3 = 0
+
+for(i in 1:dim(cat1.ship)[1]){
+  data_test$shipping_dif1[data_test$Category1 == cat1.ship[i,1]] = as.numeric(cat1.ship[i,2])
+}
+
+for(i in 1:dim(cat2.ship)[1]){
+  data_test$shipping_dif2[data_test$Category2 == cat2.ship[i,1]] = as.numeric(cat2.ship[i,2])
+}
+
+for(i in 1:dim(cat3.ship)[1]){
+  data_test$shipping_dif3[data_test$Category3 == cat3.ship[i,1]] = as.numeric(cat3.ship[i,2])
+}
+
+
+#########################################################################################################
+
+
+
+category1.counts.test = data_test %>% count(Category1)
+category2.counts.test = data_test %>% count(Category2)
+category3.counts.test = data_test %>% count(Category3)
+
+par(mar=c(10,5,3,1)) #Controls margins
+options(scipen=5) #Controls scientific notation activation 
+category1.counts.test = category1.counts.test[order(category1.counts.test$n, decreasing = T),]
+barplot(category1.counts.test$n[1:10], names.arg = category1.counts.test$Category1[1:10], las = 2)
+
+category2.counts.test = category2.counts.test[order(category2.counts.test$n, decreasing = T),]
+barplot(category2.counts.test$n[1:10], names.arg = category2.counts.test$Category2[1:10], las = 2)
+
+category3.counts.test = category3.counts.test[order(category3.counts.test$n, decreasing = T),]
+barplot(category3.counts.test$n[1:10], names.arg = category3.counts.test$Category3[1:10], las = 2)
+
+##############################################################################################################
+brand.counts.test = data_test %>% count(brand_name) #Getting the counts of each brand name.
+
+brand.counts.test.counts = brand.counts.test %>% count(n)
+brand.counts.test = brand.counts.test[order(brand.counts.test$n, decreasing = T),]
+barplot(brand.counts.test$n[1:10], names.arg = brand.counts.test$brand_name[1:10], las = 2)
+
+paste("There are", brand.counts.test$n[brand.counts.test$brand_name == "None"], "items with None brand or", 100*brand.counts.test$n[brand.counts.test$brand_name == "None"]/dim(data_test)[1], "% of the data")
+paste("Top 10 brands make up", 100*sum(sort(brand.counts.test$n, decreasing = T)[1:25])/dim(data_test)[1], "% of data")
+
+
+```
+
+
+```{r Writing TSV File, eval = FALSE}
+#Writing the final processed data as TSV files to be read and used in Python for the final portion of the project.
+
+write.table(data_clean_texts, file='data_clean_texts.tsv', quote=FALSE, sep='\t', col.names = NA)
+write.table(data_test, file='data_test.tsv', quote=FALSE, sep='\t', col.names = NA)  
+
+```
